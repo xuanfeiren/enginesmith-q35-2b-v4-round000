@@ -1,0 +1,44 @@
+--- kernels/qwen35.py	2026-11-07 18:18:42.722709209 +0000
++++ ../scratch/qwen35_bf16dr.py	2026-11-07 18:57:02.358519819 +0000
+@@ -411,20 +411,20 @@
+ 
+ def btr(x, H):
+     """psum [P, H, P]: per-head transpose of x [P, H, P] fp32"""
+-    ps = nl.ndarray((P, H, P), dtype=FP32, buffer=nl.psum)
++    ps = nl.ndarray((P, H, P), dtype=x.dtype, buffer=nl.psum)
+     for h in range(H):
+         nisa.nc_transpose(dst=ps[:, h, :], data=x[:, h, :])
+     return ps
+ 
+ 
+ def bsb(ps, H, T=P):
+-    s = nl.ndarray((P, H, T), dtype=FP32, buffer=nl.sbuf)
++    s = nl.ndarray((P, H, T), dtype=BF16, buffer=nl.sbuf)
+     nisa.tensor_copy(dst=s, src=ps)
+     return s
+ 
+ 
+ def bop(a, b, op, H, T=P):
+-    s = nl.ndarray((P, H, T), dtype=FP32, buffer=nl.sbuf)
++    s = nl.ndarray((P, H, T), dtype=BF16, buffer=nl.sbuf)
+     nisa.tensor_tensor(dst=s, data1=a, data2=b, op=op)
+     return s
+ 
+@@ -517,7 +517,7 @@
+ 
+ def dc_s3(st, a, dm, identf, H, T):
+     """M[i, h, j] = beta_i (k_i . k_j) exp(gc_i - gc_j), j < i; its transpose; the 8-block parts"""
+-    M = nl.ndarray((P, H, P), dtype=FP32, buffer=nl.sbuf)
++    M = nl.ndarray((P, H, P), dtype=BF16, buffer=nl.sbuf)
+     for h in range(H):
+         nisa.scalar_tensor_tensor(dst=M[:, h, :], data=st['g_ps'][:, h, :], op0=nl.multiply,
+                                   operand0=a['bg'][:, H + h:H + h + 1], op1=nl.multiply, operand1=st['E1'][:, h, :])
+@@ -855,7 +855,7 @@
+         nisa.tensor_scalar(dst=gneg, data=gg, op0=nl.multiply, operand0=-1.0)
+         if FIRST:
+             # S = 0: the first sub-chunk's state-dependent part runs in its zero-state form and writes Sd
+-            Sd = nl.ndarray((P, HL, P), dtype=FP32, buffer=nl.sbuf)
++            Sd = nl.ndarray((P, HL, P), dtype=BF16, buffer=nl.sbuf)
+         else:
+             Sd = bsb(btr(S, HL), HL)                               # S [dk, h, dv] for the whole call (exact transposes)
+         sel3 = sel3_tile()

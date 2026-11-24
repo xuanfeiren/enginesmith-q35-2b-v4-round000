@@ -1,0 +1,64 @@
+--- kernels/qwen35.py	2026-11-07 18:18:42.722709209 +0000
++++ ../scratch/qwen35_step2.py	2026-11-07 19:01:42.580627841 +0000
+@@ -1775,23 +1775,16 @@
+     return d
+ 
+ 
+-@nki.jit
+-def step(toks, pos, posf, emb, lnf, wlm, vofs, cos, sin, rot,
++def step_body(toks, pos, posf, emb, lnf, wlm, vofs, cos, sin, rot,
+          l_ln1, l_wqkv, l_wz, l_wab, l_convw, l_alog, l_dtb, l_normw, l_wout, l_ln2, l_wg, l_wu, l_wd,
+          l_convst, l_recst,
+-         f_ln1, f_wq, f_wk, f_wv, f_qnw, f_knw, f_wo, f_ln2, f_wg, f_wu, f_wd, f_kc, f_vc):
+-    pid = nl.program_id(0)
+-    ones_f = ones_tile(FP32)
+-    ones_b = ones_tile(BF16)
+-    ident = ident_tile()
+-    identf = ident_tile(FP32)
++         f_ln1, f_wq, f_wk, f_wv, f_qnw, f_knw, f_wo, f_ln2, f_wg, f_wu, f_wd, f_kc, f_vc, pid, ones_f, ones_b, ident, identf,
++              xbuf, xoff):
+     preg = load_pos(pos, pid)
+     pf = load_posf(posf, pid)
+     # one buffer for every exchange tile of the step (never reused: see exchange)
+-    xbuf = nl.ndarray((P, NLAYER * (3 * KT + FT), 1), dtype=BF16, buffer=nl.sbuf)
+-    nisa.memset(dst=xbuf, value=0.0)
+     XB.clear()
+-    XB.extend([xbuf, 0])
++    XB.extend([xbuf, xoff])
+     xs = embed_body(toks, preg, emb)
+ 
+ 
+@@ -1813,6 +1806,33 @@
+     PFC.clear()
+     XB.clear()
+     idi = head_body(xs, lnf, wlm, vofs, toks, pos, posf, pid, ones_f)
++    return idi
++
++
++NSTEP = 1              # decode tokens per step execution (set by the build script)
++
++
++@nki.jit
++def step(toks, pos, posf, emb, lnf, wlm, vofs, cos, sin, rot,
++         l_ln1, l_wqkv, l_wz, l_wab, l_convw, l_alog, l_dtb, l_normw, l_wout, l_ln2, l_wg, l_wu, l_wd,
++         l_convst, l_recst,
++         f_ln1, f_wq, f_wk, f_wv, f_qnw, f_knw, f_wo, f_ln2, f_wg, f_wu, f_wd, f_kc, f_vc):
++    """NSTEP whole decode steps one after the other (each: embedding, 24 layers, LM head, toks[pos + 1] = token,
++    pos += 1)"""
++    pid = nl.program_id(0)
++    ones_f = ones_tile(FP32)
++    ones_b = ones_tile(BF16)
++    ident = ident_tile()
++    identf = ident_tile(FP32)
++    XW = NLAYER * (3 * KT + FT)
++    xbuf = nl.ndarray((P, NSTEP * XW, 1), dtype=BF16, buffer=nl.sbuf)
++    nisa.memset(dst=xbuf, value=0.0)
++    for it in range(NSTEP):
++        idi = step_body(toks, pos, posf, emb, lnf, wlm, vofs, cos, sin, rot,
++                        l_ln1, l_wqkv, l_wz, l_wab, l_convw, l_alog, l_dtb, l_normw, l_wout, l_ln2, l_wg, l_wu, l_wd,
++                        l_convst, l_recst,
++                        f_ln1, f_wq, f_wk, f_wv, f_qnw, f_knw, f_wo, f_ln2, f_wg, f_wu, f_wd, f_kc, f_vc, pid, ones_f, ones_b, ident, identf,
++                        xbuf, it * XW)
+     out = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.shared_hbm)
+     nisa.dma_copy(dst=out, src=idi)
+     return out

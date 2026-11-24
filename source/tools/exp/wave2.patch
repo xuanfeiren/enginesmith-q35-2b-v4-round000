@@ -1,0 +1,259 @@
+--- kernels/qwen35.py	2026-11-07 18:18:42.722709209 +0000
++++ ../scratch/qwen35_wave2.py	2026-11-07 18:26:16.209275932 +0000
+@@ -208,7 +208,8 @@
+     is the GEMM input at once; the sum of squares (Gram diagonals), rsqrt and the [P, t] broadcast are emitted by the
+     first consuming GEMM after its own-half k tiles (norm_gram) and after its k loop (norm_bcast), so the TensorE
+     does not wait for the norm chain; outputs are bf16(rstd * (W hx)) (rounding differs from bf16(W bf16(x rstd (1 + w))))."""
+-    c = {'x': x, 'nt': nt, 't': t, 'nd': nd, 'selF': selF, 'identf': identf, 'pid': pid, 'rst': None, 'bcs': None}
++    c = {'x': x, 'nt': nt, 't': t, 'nd': nd, 'selF': selF, 'identf': identf, 'pid': pid, 'rst': None, 'bcs': None,
++         'gr': None}
+     hx = nl.ndarray((P, nt, t), dtype=BF16, buffer=nl.sbuf)
+     for k0 in range(nt):
+         k = kord(k0, nt, nt // 2, pid)
+@@ -217,16 +218,25 @@
+     return c
+ 
+ 
+-def norm_gram(c):
++def norm_gram(c, ka=0, kb=None):
++    """the norm's Gram matmuls for k positions ka .. kb - 1 (kord order; all of them by default), then (once the last
++    position is in) the diagonal, sum and rsqrt chain"""
+     if c['rst'] is not None:
+         return
+     x = c['x']
+     nt = c['nt']
+-    gr = nl.ndarray((TS, NS, TS), dtype=FP32, buffer=nl.psum)
+-    for k0 in range(nt):
++    if kb is None:
++        kb = nt
++    if c['gr'] is None:
++        gr0 = nl.ndarray((TS, NS, TS), dtype=FP32, buffer=nl.psum)
++        c['gr'] = gr0
++    gr = c['gr']
++    for k0 in range(ka, kb):
+         k = kord(k0, nt, nt // 2, c['pid'])
+         for s in range(NS):
+             nisa.nc_matmul(dst=gr[:, s, :], stationary=x[:, k, s * TS:(s + 1) * TS], moving=x[:, k, s * TS:(s + 1) * TS])
++    if kb < nt:
++        return
+     dg = nl.ndarray((TS, NS, TS), dtype=FP32, buffer=nl.sbuf)
+     nisa.tensor_tensor(dst=dg, data1=gr, data2=c['identf'].expand_dim(1).broadcast(1, NS), op=nl.multiply)
+     tot = nl.ndarray((TS, NS), dtype=FP32, buffer=nl.sbuf)
+@@ -259,7 +269,13 @@
+     return k - pid * half
+ 
+ 
+-def gemm_fm(dst, w, pid, x, nt_total, kt_total, t, group, xfull=None, resid=None, kown=0, nctx=None):
++WAVE_T = 256           # chunks of T <= WAVE_T use WAVE (else 1)
++WAVE = 2               # prefill T <= WAVE_T: leading slabs of a GEMM fed by a norm / an exchange whose own-half k tiles are all
++                       # emitted before any other-half k tile (each tile's accumulation order is unchanged)
++
++
++def gemm_fm(dst, w, pid, x, nt_total, kt_total, t, group, xfull=None, resid=None, kown=0, nctx=None, nwave=None,
++            lastg=0):
+     """dst[:, nt, :] = bf16(W_core x) feature-major. w HBM [2, P, NT, KT, 128] (this core: w[pid]);
+     x SBUF [P, KT, t] bf16; dst SBUF view [P, NT, t]. Weight slabs of `group` output tiles on the Sync HWDGE queue.
+     xfull (prefill): the full [P, 2*nt_total, t] tile dst is this core's half of; each group is sent to the other
+@@ -269,54 +285,122 @@
+         sizes.append(FIRSTG)          # the first slab after a norm is smaller: it arrives sooner
+     while sum(sizes) < nt_total:
+         sizes.append(min(group, nt_total - sum(sizes)))
++    slabs = []
+     for si in range(len(sizes)):
+         n0 = sum(sizes[:si])
+         g = sizes[si]
+-        wt = nl.ndarray((P, g, kt_total, P), dtype=BF16, buffer=nl.sbuf)
+-        nisa.dma_copy(dst=wt, src=w[pid, :, n0:n0 + g, :, :], dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
++        post = None
++        if xfull is not None:
++            post = (xfull, resid, nt_total, n0, g)
++        slabs.append((dst, n0, w, n0, g, post))
++    gemm_slabs(slabs, pid, x, kt_total, t, kown, nctx, nwave, lastg)
++
++
++def gemm_post(post, pid):
++    xfull = post[0]
++    resid = post[1]
++    nt_total = post[2]
++    n0 = post[3]
++    g = post[4]
++    exchange_part(xfull, nt_total, n0, g, pid)
++    if resid is not None:
++        # residual add per group as soon as both halves of it are here (own tiles, then the received ones)
++        rin, rout = resid
++        for c in (pid, 1 - pid):
++            lo = c * nt_total + n0
++            # the received half on the GpSimd (it runs the exchange handshake; the in-order VectorE does not wait
++            # for the exchange)
++            nisa.tensor_tensor(dst=rout[:, lo:lo + g, :], data1=rin[:, lo:lo + g, :], data2=xfull[:, lo:lo + g, :],
++                               op=nl.add, engine=(nisa.engine.gpsimd if c != pid else nisa.engine.unknown))
++
++
++def gemm_slabs(slabs, pid, x, kt_total, t, kown, nctx, nwave=None, lastg=0):
++    """slabs: (dst, dst n0, w HBM [2, P, NT, KT, 128], w n0, g, post) in order; post (gemm_post) after the slab's
++    evacuation. t > 1: the first nwave slabs (WAVE) do their own-half k tiles first, then the norm's Gram, then their
++    other-half k tiles (so the TensorE has more work that does not wait for the other core)."""
++    if nwave is None:
++        nwave = WAVE if (t > 1 and kown and T <= WAVE_T) else 1
++    si = 0
++    while si < len(slabs):
++        nv = min(len(slabs), si + (nwave if si == 0 else 1)) - si
++        wts = []
++        pss = []
++        for j in range(nv):
++            sl = slabs[si + j]
++            g = sl[4]
++            w0 = sl[3]
++            wsrc = sl[2]
++            wt = nl.ndarray((P, g, kt_total, P), dtype=BF16, buffer=nl.sbuf)
++            nisa.dma_copy(dst=wt, src=wsrc[pid, :, w0:w0 + g, :, :], dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
++            wts.append(wt)
++            if t > 1:
++                psj = nl.ndarray((P, g, t), dtype=FP32, buffer=nl.psum)
++                pss.append(psj)
+         if t > 1:
+             # k-outer over the slab's g output tiles (g PSUM banks): the first matmuls need only x[:, 0], so a GEMM
+             # starts while the producer (norm, exchange) is still finishing later k tiles; per-tile accumulation
+             # order (k = 0 .. KT-1) is unchanged
+-            ps = nl.ndarray((P, g, t), dtype=FP32, buffer=nl.psum)
+-            for k0 in range(kt_total):
+-                k = kord(k0, kt_total, kown, pid)
+-                if nctx is not None and k0 == kown:
+-                    norm_gram(nctx)           # the norm's TensorE work after this slab's own-half k tiles
+-                for i in range(g):
+-                    nisa.nc_matmul(dst=ps[:, i, :], stationary=wt[:, i, k, :], moving=x[:, k, :])
+-            if nctx is not None:
+-                norm_bcast(nctx)
+-                for i in range(g):
+-                    nisa.tensor_tensor(dst=dst[:, n0 + i, :], data1=ps[:, i, :], data2=nctx['bcs'], op=nl.multiply)
+-            for i in range(g if nctx is None else 0):
+-                if i % 2 == 1:
+-                    nisa.activation(dst=dst[:, n0 + i, :], op=nl.copy, data=ps[:, i, :])   # ScalarE (RNE, as VectorE)
++            if nv > 1 and lastg and lastg < kt_total - kown:
++                parts = [(0, kown), (kown, kt_total - lastg), (kt_total - lastg, kt_total)]
++            elif nv > 1:
++                parts = [(0, kown), (kown, kt_total)]
++            else:
++                parts = [(0, kt_total)]
++            for pi in range(len(parts)):
++                ka = parts[pi][0]
++                kb = parts[pi][1]
++                for j in range(nv):
++                    g = slabs[si + j][4]
++                    wt = wts[j]
++                    ps = pss[j]
++                    for k0 in range(ka, kb):
++                        k = kord(k0, kt_total, kown, pid)
++                        if nctx is not None and k0 == kown and nv == 1:
++                            norm_gram(nctx)           # the norm's TensorE work after this slab's own-half k tiles
++                        for i in range(g):
++                            nisa.nc_matmul(dst=ps[:, i, :], stationary=wt[:, i, k, :], moving=x[:, k, :])
++                if nv > 1 and nctx is not None:
++                    norm_gram(nctx, ka, kb)           # the Gram's part of the same k positions
++            for j in range(nv):
++                sl = slabs[si + j]
++                dst = sl[0]
++                d0 = sl[1]
++                g = sl[4]
++                ps = pss[j]
++                if nctx is not None:
++                    norm_bcast(nctx)
++                    bcs = nctx['bcs']
++                    for i in range(g):
++                        nisa.tensor_tensor(dst=dst[:, d0 + i, :], data1=ps[:, i, :], data2=bcs, op=nl.multiply)
+                 else:
+-                    nisa.tensor_copy(dst=dst[:, n0 + i, :], src=ps[:, i, :])
++                    for i in range(g):
++                        if i % 2 == 1:
++                            nisa.activation(dst=dst[:, d0 + i, :], op=nl.copy, data=ps[:, i, :])   # ScalarE (RNE)
++                        else:
++                            nisa.tensor_copy(dst=dst[:, d0 + i, :], src=ps[:, i, :])
++                if sl[5] is not None:
++                    gemm_post(sl[5], pid)
+         else:
+-            for i in range(g):
+-                ps = nl.ndarray((P, t), dtype=FP32, buffer=nl.psum)
+-                for k in range(kt_total):
+-                    nisa.nc_matmul(dst=ps, stationary=wt[:, i, k, :], moving=x[:, k, :])
+-                nisa.tensor_copy(dst=dst[:, n0 + i, :], src=ps)
+-        if xfull is not None:
+-            exchange_part(xfull, nt_total, n0, g, pid)
+-            if resid is not None:
+-                # residual add per group as soon as both halves of it are here (own tiles, then the received ones)
+-                rin, rout = resid
+-                for c in (pid, 1 - pid):
+-                    lo = c * nt_total + n0
+-                    # the received half on the GpSimd (it runs the exchange handshake; the in-order VectorE does not wait
+-                    # for the exchange)
+-                    nisa.tensor_tensor(dst=rout[:, lo:lo + g, :], data1=rin[:, lo:lo + g, :], data2=xfull[:, lo:lo + g, :],
+-                                       op=nl.add, engine=(nisa.engine.gpsimd if c != pid else nisa.engine.unknown))
++            for j in range(nv):
++                sl = slabs[si + j]
++                dst = sl[0]
++                d0 = sl[1]
++                g = sl[4]
++                wt = wts[j]
++                for i in range(g):
++                    ps1 = nl.ndarray((P, t), dtype=FP32, buffer=nl.psum)
++                    for k in range(kt_total):
++                        nisa.nc_matmul(dst=ps1, stationary=wt[:, i, k, :], moving=x[:, k, :])
++                    nisa.tensor_copy(dst=dst[:, d0 + i, :], src=ps1)
++                if sl[5] is not None:
++                    gemm_post(sl[5], pid)
++        si += nv
+ 
+ 
+ def gemm_n(dst, w, pid, h, nt_total, kt_total, t, group):
+     """gemm_fm on the output of rmsnorm_fm (a norm_ctx dict when deferred: own-half k tiles first)"""
+     if t > 1 and RSD:
+-        gemm_fm(dst, w, pid, h['hx'], nt_total, kt_total, t, group, kown=kt_total // 2, nctx=h)
++        gemm_fm(dst, w, pid, h['hx'], nt_total, kt_total, t, group, kown=kt_total // 2, nctx=h, lastg=2)
+     else:
+         gemm_fm(dst, w, pid, h, nt_total, kt_total, t, group)
+ 
+@@ -372,9 +456,13 @@
+         G = 4
+         for n0 in range(0, FL, G):
+             gate = nl.ndarray((P, G, t), dtype=BF16, buffer=nl.sbuf)
+-            gemm_n(gate, wg[:, :, n0:n0 + G, :, :], pid, h, G, KT, t, G)
+             up = nl.ndarray((P, G, t), dtype=BF16, buffer=nl.sbuf)
+-            gemm_n(up, wu[:, :, n0:n0 + G, :, :], pid, h, G, KT, t, G)
++            if n0 == 0 and RSD and WAVE > 1 and T <= WAVE_T:
++                # the first gate and up slabs as one wave (own-half k tiles of both before the other half)
++                gemm_slabs([(gate, 0, wg, 0, G, None), (up, 0, wu, 0, G, None)], pid, h['hx'], KT, t, KT // 2, h, lastg=2)
++            else:
++                gemm_n(gate, wg[:, :, n0:n0 + G, :, :], pid, h, G, KT, t, G)
++                gemm_n(up, wu[:, :, n0:n0 + G, :, :], pid, h, G, KT, t, G)
+             act = nl.ndarray((P, G, t), dtype=BF16, buffer=nl.sbuf)
+             nisa.activation(dst=act, op=nl.silu, data=gate)
+             nisa.tensor_tensor(dst=m[:, pid * FL + n0:pid * FL + n0 + G, :], data1=act, data2=up, op=nl.multiply)
+@@ -386,7 +474,8 @@
+         exchange(dn, 8, pid, t)
+         nisa.tensor_tensor(dst=x2, data1=x1, data2=dn, op=nl.add)
+     else:
+-        gemm_fm(dn[:, pid * 8:pid * 8 + 8, :], wd, pid, m, 8, FT, t, 2, xfull=dn, resid=(x1, x2), kown=FL)
++        gemm_fm(dn[:, pid * 8:pid * 8 + 8, :], wd, pid, m, 8, FT, t, 2, xfull=dn, resid=(x1, x2), kown=FL,
++                nwave=(4 if T <= WAVE_T else 1), lastg=4)
+     return x2
+ 
+ 
+@@ -990,7 +1079,8 @@
+         exchange(att, 8, pid, T)
+         nisa.tensor_tensor(dst=x1, data1=xs, data2=att, op=nl.add)
+     else:
+-        gemm_fm(att[:, pid * 8:pid * 8 + 8, :], wout, pid, y, 8, KT, T, OPG, xfull=att, resid=(xs, x1), kown=HL)
++        gemm_fm(att[:, pid * 8:pid * 8 + 8, :], wout, pid, y, 8, KT, T, OPG, xfull=att, resid=(xs, x1), kown=HL,
++                nwave=(4 if T <= WAVE_T else 1), lastg=YG)
+     x2 = mlp_block(x1, ln2, wg, wu, wd, pid, T, ones_f, selF, identf)
+     return x2
+ 
+@@ -1261,7 +1351,8 @@
+         exchange(att, 8, pid, T)
+         nisa.tensor_tensor(dst=x1, data1=xs, data2=att, op=nl.add)
+     else:
+-        gemm_fm(att[:, pid * 8:pid * 8 + 8, :], wo, pid, ao, 8, KT, T, OPG, xfull=att, resid=(xs, x1), kown=2 * QH)
++        gemm_fm(att[:, pid * 8:pid * 8 + 8, :], wo, pid, ao, 8, KT, T, OPG, xfull=att, resid=(xs, x1), kown=2 * QH,
++                nwave=(4 if T <= WAVE_T else 1))
+     x2 = mlp_block(x1, ln2, wg, wu, wd, pid, T, ones_f, selF, identf)
+     return x2
+ 

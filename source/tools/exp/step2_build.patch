@@ -1,0 +1,22 @@
+--- kernels/build_neffs.py	2026-11-07 18:12:41.009225680 +0000
++++ ../scratch/build_neffs_step2.py	2026-11-07 19:01:24.278569623 +0000
+@@ -37,6 +37,7 @@
+             v[f"full_t{t}_l{b}"] = ("full_layer", t, b)
+     for b in STEP_BUCKETS:
+         v[f"step_l{b}"] = ("step", 1, b)
++        v[f"step2_l{b}"] = ("step", 2, b)
+     v["zero_states"] = ("zero_states", 1, 0)
+     for t in PCHUNK_TS:
+         v[f"headna_t{t}"] = ("headna", t, 0)
+@@ -93,6 +94,11 @@
+                 z((K.MAXPOS + 128,), i32), z((2, 1, 1), i32), z((2, P, 1), f32))
+         fn = K.head
+     elif kind == "step":
++        K.NSTEP = t
++        K.T = 1
++        K.TS = 1
++        K.NS = 1
++        K.HEADCOL = 0
+         NL, NF = 18, 6
+         args = (z((K.MAXPOS + 128,), i32), z((2, 1, 1), i32), z((2, P, 1), f32), z((K.VOCAB, D)), z((P, 16)),
+                 z((2, P, K.VTL, 16, 128)), z((2, P, 1), f32), z((64, K.MAXPOS)), z((64, K.MAXPOS)), z((P, P)),
